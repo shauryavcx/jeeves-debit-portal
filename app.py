@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="Jeeves Partner Debit Portal", layout="wide")
 
 # --- ADMIN ACCESS CONFIGURATION ---
-# Add your internal Admin email IDs here (lowercase)
 ADMIN_USERS = {
     "shauryakumar.vc@flipkart.com": "Admin123",
 }
@@ -35,52 +34,52 @@ def parse_currency(series):
         .fillna(0.0)
     )
 
-# --- CACHED EXCEL PARSERS ---
-@st.cache_data(show_spinner="Reading Partner Master workbook...")
+def read_tabular_file(file, preferred_keywords=None, fallback_last=False):
+    if file.name.lower().endswith(".csv"):
+        try:
+            return pd.read_csv(file, low_memory=False)
+        except UnicodeDecodeError:
+            file.seek(0)
+            return pd.read_csv(file, encoding="latin1", low_memory=False)
+    else:
+        xl = pd.ExcelFile(file, engine="openpyxl")
+        target_sheet = xl.sheet_names[-1] if fallback_last else xl.sheet_names[0]
+        if preferred_keywords:
+            for s in xl.sheet_names:
+                if all(k in s.lower() for k in preferred_keywords):
+                    target_sheet = s
+                    break
+        return pd.read_excel(xl, sheet_name=target_sheet)
+
+# --- CACHED PARSERS ---
+@st.cache_data(show_spinner="Loading Partner Master...")
 def load_partner_master(file):
-    xl = pd.ExcelFile(file)
-    target_sheet = next(
-        (s for s in xl.sheet_names if "active" in s.lower() and "partner" in s.lower()),
-        xl.sheet_names[0],
-    )
-    df = pd.read_excel(xl, sheet_name=target_sheet)
+    df = read_tabular_file(file, preferred_keywords=["active", "partner"])
     df.columns = [clean_str(c) for c in df.columns]
 
     email_col = get_col(df, ["Email Id", "Email", "Email_Id"])
     sf_code_col = get_col(df, ["SF code", "SF Code", "Branch"])
     sf_name_col = get_col(df, ["SF Name", "SF_Name", "Partner Name"])
     contact_col = get_col(df, ["CONTACT NO's", "Contact No", "Mobile"])
-    status_col = get_col(df, ["STATUS(ACTIVE/INACTIVE)", "Status"])
 
-    # Build lookup: email -> {codes: set, names: set, passwords: set, status: str}
     partner_lookup = {}
     for _, row in df.iterrows():
         raw_emails = clean_str(row[email_col]) if email_col else ""
         sf_code = clean_str(row[sf_code_col]).upper() if sf_code_col else ""
         sf_name = clean_str(row[sf_name_col]) if sf_name_col else sf_code
         raw_contact = clean_str(row[contact_col]) if contact_col else ""
-        status = clean_str(row[status_col]) if status_col else "Active"
 
         if not raw_emails or not sf_code:
             continue
 
-        # Split multiple emails separated by /, ;, or ,
         emails = [e.strip().lower() for e in re.split(r"[/;,]", raw_emails) if "@" in e]
-
-        # Valid passwords: SF code OR primary 10-digit contact number
         valid_passwords = {sf_code.lower()}
-        digits = re.findall(r"\d{10}", raw_contact)
-        for d in digits:
+        for d in re.findall(r"\d{10}", raw_contact):
             valid_passwords.add(d)
 
         for em in emails:
             if em not in partner_lookup:
-                partner_lookup[em] = {
-                    "codes": set(),
-                    "names": set(),
-                    "passwords": set(),
-                    "status": status,
-                }
+                partner_lookup[em] = {"codes": set(), "names": set(), "passwords": set()}
             partner_lookup[em]["codes"].add(sf_code)
             if sf_name:
                 partner_lookup[em]["names"].add(sf_name)
@@ -88,78 +87,55 @@ def load_partner_master(file):
 
     return partner_lookup
 
-@st.cache_data(show_spinner="Reading SCM Debit (Billing) workbook...")
+@st.cache_data(show_spinner="Loading SCM Debit data...")
 def load_scm_debit(file):
-    xl = pd.ExcelFile(file)
-    # Handle "Blling Data" typo or any "Billing Data" sheet
-    target_sheet = next(
-        (s for s in xl.sheet_names if "data" in s.lower() and ("blling" in s.lower() or "billing" in s.lower())),
-        xl.sheet_names[-1],
-    )
-    df = pd.read_excel(xl, sheet_name=target_sheet)
+    df = read_tabular_file(file, preferred_keywords=["data"], fallback_last=True)
     df.columns = [clean_str(c) for c in df.columns]
 
     sf_col = get_col(df, ["SF Code", "SF code", "Branch"])
-    if sf_col:
-        df["_RLS_CODE"] = df[sf_col].apply(lambda x: clean_str(x).upper())
-    else:
-        df["_RLS_CODE"] = ""
+    df["_RLS_CODE"] = df[sf_col].apply(lambda x: clean_str(x).upper()) if sf_col else ""
 
     month_col = get_col(df, ["Billing Month", "Month"])
-    if month_col:
-        df["_PERIOD"] = df[month_col].apply(clean_str)
-    else:
-        df["_PERIOD"] = "Unspecified"
+    df["_PERIOD"] = df[month_col].apply(clean_str) if month_col else "Unspecified"
 
     price_col = get_col(df, ["Total Price", "Total_Price"])
     cn_col = get_col(df, ["CN Amount", "CN_Amount"])
     df["_BILLED_AMT"] = parse_currency(df[price_col]) if price_col else 0.0
     df["_CN_AMT"] = parse_currency(df[cn_col]) if cn_col else 0.0
     df["_NET_SCM_DEBIT"] = (df["_BILLED_AMT"] - df["_CN_AMT"]).clip(lower=0.0)
-
     return df
 
-@st.cache_data(show_spinner="Reading Fake Debit (Audited Data) workbook...")
+@st.cache_data(show_spinner="Loading Fake Debit data...")
 def load_fake_debit(file):
-    xl = pd.ExcelFile(file)
-    df = pd.read_excel(xl, sheet_name=xl.sheet_names[0])
+    df = read_tabular_file(file)
     df.columns = [clean_str(c) for c in df.columns]
 
     branch_col = get_col(df, ["Branch", "SF Code", "SF code"])
-    if branch_col:
-        df["_RLS_CODE"] = df[branch_col].apply(lambda x: clean_str(x).upper())
-    else:
-        df["_RLS_CODE"] = ""
+    df["_RLS_CODE"] = df[branch_col].apply(lambda x: clean_str(x).upper()) if branch_col else ""
 
     month_col = get_col(df, ["Month", "Billing Month"])
-    if month_col:
-        df["_PERIOD"] = df[month_col].apply(clean_str)
-    else:
-        df["_PERIOD"] = "Unspecified"
+    df["_PERIOD"] = df[month_col].apply(clean_str) if month_col else "Unspecified"
 
     gen_col = get_col(df, ["Genuine/Fake", "Genuine_Fake"])
-    if gen_col:
-        df["_IS_FAKE"] = df[gen_col].astype(str).str.contains("fake", case=False, na=False)
-    else:
-        df["_IS_FAKE"] = False
+    df["_IS_FAKE"] = df[gen_col].astype(str).str.contains("fake", case=False, na=False) if gen_col else False
 
     charge_col = get_col(df, ["Installation Charges", "Penalty Amount", "Penalty"])
     df["_FAKE_DEBIT_AMT"] = parse_currency(df[charge_col]) if charge_col else 0.0
-
     return df
 
 # --- SIDEBAR DATA LOADER ---
-st.sidebar.title("📂 Workbook Loader")
-master_file = st.sidebar.file_uploader("1. Main Jeeves Master (.xlsx)", type=["xlsx"])
-scm_file = st.sidebar.file_uploader("2. SCM Debit - Billing (.xlsx)", type=["xlsx"])
-fake_file = st.sidebar.file_uploader("3. Fake Debit - Audited Data (.xlsx)", type=["xlsx"])
+st.sidebar.title("📂 Data Loader")
+st.sidebar.caption("Tip: Upload .csv files for instant loading (avoids 30MB+ Excel memory limits).")
+master_file = st.sidebar.file_uploader("1. Main Jeeves Master (.csv / .xlsx)", type=["csv", "xlsx"])
+scm_file = st.sidebar.file_uploader("2. SCM Debit - Billing (.csv / .xlsx)", type=["csv", "xlsx"])
+fake_file = st.sidebar.file_uploader("3. Fake Debit - Audited Data (.csv / .xlsx)", type=["csv", "xlsx"])
 
 if not master_file or not scm_file or not fake_file:
     st.title("Jeeves Partner Debit & Audit Portal")
     st.info(
-        "👈 Please upload the **3 Excel workbooks (.xlsx)** in the sidebar to activate the portal:\n"
-        "1. **Main Jeeves Master** (for Partner Emails & RLS mapping)\n"
-        "2. **Jeeves - Billing** (SCM Debit)\n"
+        "👈 Please upload the **3 files (.csv or .xlsx)** in the sidebar to activate the portal:\n"
+        "1. **Main Jeeves Master** (`Data SF Active partners` tab)\n"
+        "2. **Jeeves - Billing** (`Blling Data` tab — SCM Debit)\n"
         "3. **Master Audited Data** (Fake Debit)"
     )
     st.stop()
@@ -233,7 +209,6 @@ else:
             scm_view = df_scm[df_scm["_RLS_CODE"] == selected_code].copy()
             fake_view = df_fake[df_fake["_RLS_CODE"] == selected_code].copy()
     else:
-        # Strict RLS lock for Partners (supports multi-branch Common Partners)
         if len(allowed_codes) > 1:
             selected_code = st.sidebar.selectbox("Your Assigned Branches", ["ALL MY BRANCHES"] + allowed_codes)
             if selected_code == "ALL MY BRANCHES":
@@ -302,9 +277,9 @@ else:
                     "Billing reason", "SCM Head Approval Status", "Final Status"
                 ] if c in scm_view.columns
             ]
-            st.dataframe(scm_view[display_scm_cols], use_container_width=True)
+            st.dataframe(scm_view[display_scm_cols].head(5000), use_container_width=True)
             st.download_button(
-                "⬇️ Download SCM Debit Report (CSV)",
+                "⬇️ Download Full SCM Debit Report (CSV)",
                 data=scm_view[display_scm_cols].to_csv(index=False).encode("utf-8"),
                 file_name="SCM_Debit_Report.csv",
                 mime="text/csv",
@@ -342,9 +317,9 @@ else:
                     "Product_Service_Subcat_New", "Installation Charges"
                 ] if c in fake_view.columns
             ]
-            st.dataframe(fake_view[display_fake_cols], use_container_width=True)
+            st.dataframe(fake_view[display_fake_cols].head(5000), use_container_width=True)
             st.download_button(
-                "⬇️ Download Fake Debit Report (CSV)",
+                "⬇️ Download Full Fake Debit Report (CSV)",
                 data=fake_view[display_fake_cols].to_csv(index=False).encode("utf-8"),
                 file_name="Fake_Debit_Report.csv",
                 mime="text/csv",
